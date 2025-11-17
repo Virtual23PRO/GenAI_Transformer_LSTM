@@ -240,7 +240,8 @@ class DecoderOnlyTransformer(nn.Module):
 
 def train_epoch(model, loader, opt, pad_id, amp_dtype=AMP_DTYPE, accum_steps=1, update_every=20):
     model.train()
-    total_loss, total_tok = 0.0, 0
+    total_loss, total_tok = 0.0, 0 #acc need to ppl
+
     opt.zero_grad(set_to_none=True)
     bar = tqdm(total=len(loader), desc="train", dynamic_ncols=True)
 
@@ -249,15 +250,18 @@ def train_epoch(model, loader, opt, pad_id, amp_dtype=AMP_DTYPE, accum_steps=1, 
         y = batch["labels"].to(x.device, non_blocking=True)
 
         with torch.cuda.amp.autocast(dtype=amp_dtype):
-            logp = model(x)
-            loss = F.nll_loss(logp.view(-1, logp.size(-1)), y.view(-1),
+            logp = model(x) #[B, L, V]
+            loss = F.nll_loss(logp.view(-1, logp.size(-1)), ## [B*L, V]
+                              y.view(-1), # [B*L]
                               ignore_index=pad_id if pad_id is not None else -100)
             loss = loss / accum_steps
 
-        SCALER.scale(loss).backward()
+        SCALER.scale(loss).backward()# gradient
+
         if i % accum_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            SCALER.step(opt); SCALER.update()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #gradient clip
+            SCALER.step(opt) #gradient step 
+            SCALER.update() #fight with overflow
             opt.zero_grad(set_to_none=True)
 
         with torch.no_grad():
@@ -277,11 +281,13 @@ def train_epoch(model, loader, opt, pad_id, amp_dtype=AMP_DTYPE, accum_steps=1, 
 def eval_ppl(model, loader, pad_id):
     model.eval()
     total_loss, total_tok = 0.0, 0
+
     for batch in tqdm(loader, desc="valid", leave=False, dynamic_ncols=True):
         x = batch["input_ids"].to(model.lm.weight.device)
         y = batch["labels"].to(x.device)
         logp = model(x)
-        loss = F.nll_loss(logp.view(-1, logp.size(-1)), y.view(-1),
+        loss = F.nll_loss(logp.view(-1, logp.size(-1)),
+                           y.view(-1),
                           ignore_index=pad_id if pad_id is not None else -100, reduction="sum")
         total_loss += loss.item()
         total_tok  += y.numel() if pad_id is None else (y != pad_id).sum().item()
@@ -320,7 +326,9 @@ def main():
     args = ap.parse_args()
     
 
-    random.seed(args.seed); torch.manual_seed(args.seed)
+    random.seed(args.seed); 
+    torch.manual_seed(args.seed)
+
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     tokenizer, pad_id, bos_id, eos_id = load_tokenizer(args)
@@ -350,7 +358,9 @@ def main():
     else:
         pass 
     
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = DecoderOnlyTransformer(
         vocab_size=vocab_size,
         d_model=args.d_model,
