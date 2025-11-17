@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os, math, gzip, argparse, random, json
 from pathlib import Path
 from typing import List, Optional
@@ -11,10 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 from transformers import AutoTokenizer
 from tqdm import tqdm
-from tokenizers import decoders
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -22,8 +17,7 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 SCALER = torch.cuda.amp.GradScaler()
 AMP_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
-SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[BOS]", "[EOS]"]
+TOKENIZER_ID = "speakleash/Bielik-7B-v0.1"
 
 def _sample_next(logits, temperature=0.9, top_p=0.9):
     if temperature > 0:
@@ -55,14 +49,6 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=150, temperature=0.9,
         x = torch.cat([x, next_id], dim=1)
     return tok_decode(tokenizer, x[0].tolist())
 
-def train_bpe_tokenizer(files: List[Path], vocab_size=50000) -> Tokenizer:
-    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
-    tok.pre_tokenizer = pre_tokenizers.ByteLevel()
-    tok.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS)
-    tok.train(files=[str(f) for f in files], trainer=trainer)
-    return tok
-
 def tok_encode(tokenizer, text: str):
     try:
         out = tokenizer.encode(text, add_special_tokens=False)  
@@ -77,39 +63,12 @@ def tok_decode(tokenizer, ids):
         return tokenizer.decode(ids)
 
 def load_tokenizer(args):
-    tok_dir = Path(args.output_dir)
+    tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
 
-    # 1) Jawnie podany tokenizer (HF lub lokalny folder z tokenizer.json)
-    if args.hf_tokenizer_id:
-        tok = AutoTokenizer.from_pretrained(args.hf_tokenizer_id, use_fast=True)
-        if tok.pad_token is None:
-            tok.add_special_tokens({"pad_token": "[PAD]"})
-        return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "[PAD]"})
 
-    # 2) Preferuj binarny tokenizer z `tokenizers` (najprostszy przypadek)
-    if (tok_dir / "tokenizer.json").exists():
-        tok = Tokenizer.from_file(str(tok_dir / "tokenizer.json"))
-        tok.decoder = decoders.ByteLevel()
-        pad_id = tok.token_to_id("[PAD]")
-        bos_id = tok.token_to_id("[BOS]")
-        eos_id = tok.token_to_id("[EOS]")
-        return tok, pad_id, bos_id, eos_id
-
-    # 3) Dopiero jeśli istnieje poprawnie zapisany katalog HF
-    if (tok_dir / "tokenizer_hf").exists() and any((tok_dir / "tokenizer_hf").glob("tokenizer*.json")):
-        tok = AutoTokenizer.from_pretrained(tok_dir / "tokenizer_hf", use_fast=True)
-        if tok.pad_token is None:
-            tok.add_special_tokens({"pad_token": "[PAD]"})
-        return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
-
-    # 4) Brak gotowego tokenizer-a -> trenuj z plików
-    files = sorted(Path(args.data_dir).glob("*.txt")) + sorted(Path(args.data_dir).glob("*.txt.gz"))
-    assert files, "Brak plików .txt/.txt.gz w data_dir"
-    tok = train_bpe_tokenizer(files, args.vocab_size)
-    pad_id = tok.token_to_id("[PAD]")
-    bos_id = tok.token_to_id("[BOS]")
-    eos_id = tok.token_to_id("[EOS]")
-    return tok, pad_id, bos_id, eos_id
+    return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
 
 
 def _read_text(fp: Path) -> str:
@@ -134,7 +93,7 @@ class CLMDataset(Dataset):
     def __init__(self, token_ids: List[int], seq_len=128, stride: Optional[int] = None):
         self.ids = token_ids
         self.seq_len = seq_len
-        self.stride = stride or seq_len  # domyślnie bez nakładki
+        self.stride = stride or seq_len  
         if len(self.ids) < (self.seq_len + 1):
             self.n = 0
         else:
@@ -257,10 +216,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--output_dir", default="out_lstm")
-    ap.add_argument("--hf_tokenizer_id", default=None)  
-    ap.add_argument("--vocab_size", type=int, default=50000)
 
-    # trening / model
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--stride",  type=int, default=None)
     ap.add_argument("--batch_size", type=int, default=128)
@@ -274,7 +230,6 @@ def main():
     ap.add_argument("--accum_steps", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
 
-    # generacja
     ap.add_argument("--gen", action="store_true", help="Tylko generacja (bez treningu)")
     ap.add_argument("--ckpt", type=str, default=None, help="Ścieżka do .pt (last/best)")
     ap.add_argument("--prompts", nargs="*", default=[], help="Lista promptów do wygenerowania")
@@ -290,12 +245,7 @@ def main():
 
     tokenizer, pad_id, bos_id, eos_id = load_tokenizer(args)
 
-    if hasattr(tokenizer, "get_vocab"):
-        vocab_size = len(tokenizer.get_vocab())
-    elif hasattr(tokenizer, "get_vocab_size"):
-        vocab_size = int(tokenizer.get_vocab_size())
-    else:
-        vocab_size = int(getattr(tokenizer, "vocab_size"))
+    vocab_size = tokenizer.vocab_size
 
     vocab_size = max(
         vocab_size,
@@ -306,26 +256,9 @@ def main():
 
     if not args.gen:
         out_tok = Path(args.output_dir)
-        if not (out_tok / "tokenizer_hf").exists() and not (out_tok / "tokenizer.json").exists():
-            try:
-                # jeśli to jest tokenizer z HF (np. PreTrainedTokenizerFast)
-                if hasattr(tokenizer, "save_pretrained"):
-                    (out_tok / "tokenizer_hf").mkdir(parents=True, exist_ok=True)
-                    tokenizer.save_pretrained(str(out_tok / "tokenizer_hf"))
-                else:
-                    # tokenizer z biblioteki `tokenizers`
-                    from tokenizers import Tokenizer as _Tok
-                    if isinstance(tokenizer, _Tok):
-                        tokenizer.save(str(out_tok / "tokenizer.json"))
-                    else:
-                        # awaryjnie
-                        (out_tok / "tokenizer.json").write_text(tokenizer.to_str(), encoding="utf-8")
-            except Exception:
-                # fallback – w razie czego spróbuj jeszcze raz do JSON
-                try:
-                    tokenizer.save(str(out_tok / "tokenizer.json"))
-                except Exception:
-                    (out_tok / "tokenizer.json").write_text(tokenizer.to_str(), encoding="utf-8")
+        if not (out_tok / "tokenizer_hf").exists():
+            (out_tok / "tokenizer_hf").mkdir(parents=True, exist_ok=True)
+            tokenizer.save_pretrained(str(out_tok / "tokenizer_hf"))
 
     cfg_path = Path(args.output_dir) / "model_config.json"
 
@@ -425,11 +358,9 @@ def main():
         tokens_epoch_est = steps * args.batch_size * args.seq_len
         tps = tokens_epoch_est / max(1e-9, epoch_sec)
     
-        # „loss” = ln(PPL) – pomocniczo
         tr_loss = math.log(tr_ppl) if tr_ppl > 0 else float("nan")
         va_loss = math.log(va_ppl) if (va_ppl > 0 and not math.isnan(va_ppl)) else float("nan")
     
-        # --- zapis do CSV ---
         log_metrics_csv(log_path, {
             "epoch": e,
             "split": "train",

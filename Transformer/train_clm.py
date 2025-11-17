@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from tokenizers import Tokenizer, models, trainers, pre_tokenizers
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
@@ -18,8 +17,7 @@ torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
 SCALER = torch.cuda.amp.GradScaler()
 AMP_DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-
-SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[BOS]", "[EOS]"]
+TOKENIZER_ID = "speakleash/Bielik-7B-v0.1"
 
 
 def _sample_next(logits, temperature=0.9, top_p=0.9):
@@ -32,109 +30,67 @@ def _sample_next(logits, temperature=0.9, top_p=0.9):
         mask[..., 1:] = mask[..., :-1].clone()
         mask[..., 0] = False
         sorted_probs[mask] = 0
-        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-        next_id = torch.multinomial(sorted_probs, 1)
-        return sorted_idx.gather(-1, next_id)
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True) #norm to 1
+        next_id = torch.multinomial(sorted_probs, 1) #inx sort tab
+        return sorted_idx.gather(-1, next_id) #org index volcab
     else:
-        return logits.argmax(dim=-1, keepdim=True)
+        return logits.argmax(dim=-1, keepdim=True) #greedy
+
 
 @torch.no_grad()
 def generate_text(model, tokenizer, prompt, max_new_tokens=150, temperature=0.9, top_p=0.9):
-    model.eval()
-    ids = tok_encode(tokenizer, prompt)                         # <- wrapper
-    x = torch.tensor([ids], device=next(model.parameters()).device)
+    model.eval() #evaluation mode
+    ids = tok_encode(tokenizer, prompt)   #to id
+    x = torch.tensor([ids], device=next(model.parameters()).device) #[1,L]
     for _ in range(max_new_tokens):
-        inp = x[:, -model.pos.pe.size(0):]
-        logp = model(inp)                                       # [B, L, V] (log-softmax)
+        inp = x[:, -model.pos.pe.size(0):] #max_len cut
+        logp = model(inp) # [B, L, V] 
         next_id = _sample_next(logp[:, -1, :].float(), temperature, top_p)
         x = torch.cat([x, next_id], dim=1)
     return tok_decode(tokenizer, x[0].tolist())
 
 
-# -------------------- Tokenizer --------------------
-def train_bpe_tokenizer(files: List[Path], vocab_size=50000) -> Tokenizer:
-    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
-    tok.pre_tokenizer = pre_tokenizers.ByteLevel()
-    trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL_TOKENS)
-    tok.train(files=[str(f) for f in files], trainer=trainer)
-    return tok
 
 def tok_encode(tokenizer, text: str):
-    try:
-        out = tokenizer.encode(text, add_special_tokens=False)  # HF fast -> list[int]
-    except TypeError:
-        out = tokenizer.encode(text)                            # tokenizers.Tokenizer -> Encoding
-    return out.ids if hasattr(out, "ids") else out              # zawsze list[int]
+    return tokenizer.encode(text, add_special_tokens=False)
 
 def tok_decode(tokenizer, ids):
-    try:
-        return tokenizer.decode(ids, skip_special_tokens=True)
-    except TypeError:
-        # ścieżka dla tokenizers.Tokenizer
-        return tokenizer.decode(ids)
+    return tokenizer.decode(ids, skip_special_tokens=True)
+
 
 
 def load_tokenizer(args):
-    tok_dir = Path(args.output_dir)
-
-    # 0) Jeśli podano HF – bierz HF *zawsze*.
-    if args.hf_tokenizer_id:
-        tok = AutoTokenizer.from_pretrained(args.hf_tokenizer_id, use_fast=True)
-        if tok.pad_token is None:
-            tok.add_special_tokens({"pad_token": "[PAD]"})
-        return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
-
-    # 1) Lokalny zapisany (HF)
-    if (tok_dir / "tokenizer_hf").exists():
-        tok = AutoTokenizer.from_pretrained(tok_dir / "tokenizer_hf", use_fast=True)
-        if tok.pad_token is None:
-            tok.add_special_tokens({"pad_token": "[PAD]"})
-        return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
-
-    # 2) Lokalny tokenizers.Tokenizer
-    if (tok_dir / "tokenizer.json").exists():
-        tok = Tokenizer.from_file(str(tok_dir / "tokenizer.json"))
-        pad_id = tok.token_to_id("[PAD]")
-        bos_id = tok.token_to_id("[BOS]")
-        eos_id = tok.token_to_id("[EOS]")
-        return tok, pad_id, bos_id, eos_id
+    tok = AutoTokenizer.from_pretrained(TOKENIZER_ID, use_fast=True)
+    if tok.pad_token is None:
+        tok.add_special_tokens({"pad_token": "[PAD]"})
+    return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
 
 
-    # 3) Brak – trenuj własny
-    files = sorted(Path(args.data_dir).glob("*.txt")) + sorted(Path(args.data_dir).glob("*.txt.gz"))
-    assert files, "Brak plików .txt/.txt.gz w data_dir"
-    tok = train_bpe_tokenizer(files, args.vocab_size)
-    pad_id = tok.token_to_id("[PAD]")
-    bos_id = tok.token_to_id("[BOS]")
-    eos_id = tok.token_to_id("[EOS]")
-    return tok, pad_id, bos_id, eos_id
-
-
-
-# -------------------- Dane --------------------
 def _read_text(fp: Path) -> str:
     if str(fp).endswith(".gz"):
         with gzip.open(fp, "rt", encoding="utf-8", errors="ignore") as f:
             return f.read()
     return fp.read_text(encoding="utf-8", errors="ignore")
 
+
 def encode_corpus(tokenizer, files, bos_id=None, eos_id=None):
     ids = []
     for fp in files:
         txt = _read_text(fp)
         for ln in txt.splitlines():
-            if not ln.strip(): continue
+            if not ln.strip(): continue #drop enter, space
             piece = tok_encode(tokenizer, ln)
             if bos_id is not None: piece = [bos_id] + piece
             if eos_id is not None: piece = piece + [eos_id]
             ids.extend(piece)
     return ids
 
+
 class CLMDataset(Dataset):
     def __init__(self, token_ids: List[int], seq_len=128, stride: Optional[int] = None):
         self.ids = token_ids
         self.seq_len = seq_len
-        self.stride = stride or seq_len  # domyślnie brak nakładania
+        self.stride = stride or seq_len  
 
         if len(self.ids) < (self.seq_len + 1):
             self.n = 0
@@ -148,6 +104,7 @@ class CLMDataset(Dataset):
         start = i * self.stride
         end = start + self.seq_len + 1
         chunk = self.ids[start:end]
+
         if len(chunk) < self.seq_len + 1:
             start = max(0, len(self.ids) - (self.seq_len + 1))
             chunk = self.ids[start:start + self.seq_len + 1]
@@ -169,30 +126,21 @@ def log_metrics_csv(path: Path, row: dict, field_order):
             w.writeheader()
         w.writerow(row)
 
-# -------------------- Model (decoder-only, mały) --------------------
-class LayerNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-5):
-        super().__init__()
-        self.g = nn.Parameter(torch.ones(d_model))
-        self.b = nn.Parameter(torch.zeros(d_model))
-        self.eps = eps
-    def forward(self, x):
-        m = x.mean(-1, keepdim=True)
-        v = x.var(-1, unbiased=False, keepdim=True)
-        return self.g * (x - m) / torch.sqrt(v + self.eps) + self.b
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=4096):
         super().__init__()
         self.drop = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)
+        pe = torch.zeros(max_len, d_model) #matrix [max_len, d_model]
+
         pos = torch.arange(0, max_len).unsqueeze(1)
         div = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe)
+        self.register_buffer("pe", pe) #save to buffer
+
     def forward(self, x):
-        L = x.size(1)
+        L = x.size(1) #size [B, L, d_model]
         x = x + self.pe[:L].unsqueeze(0)
         return self.drop(x)
 
@@ -205,30 +153,37 @@ class Embeddings(nn.Module):
 
 def scaled_dot_attn(q, k, v, mask=None, dropout=None):
     dk = q.size(-1)
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(dk)
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(dk) # after translation[B, h, dk, L] - matmul [B, h, L, dk] x [B, h, dk, L] -> [B, h, L, L]
     if mask is not None: scores = scores.masked_fill(mask, float("-inf"))
+
     p = torch.softmax(scores, dim=-1)
     if dropout is not None: p = dropout(p)
-    return torch.matmul(p, v), p
+    return torch.matmul(p, v), p #[B, h, L, dk]
 
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         super().__init__()
         assert d_model % h == 0
-        self.h = h; self.dk = d_model // h
+        self.h = h
+        self.dk = d_model // h
         self.q = nn.Linear(d_model, d_model)
         self.k = nn.Linear(d_model, d_model)
         self.v = nn.Linear(d_model, d_model)
         self.o = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
+
     def _split(self, x):
         B, L, D = x.shape
-        return x.view(B, L, self.h, self.dk).transpose(1, 2)
+        return x.view(B, L, self.h, self.dk).transpose(1, 2) # -> [B, h, L, dk]
+    
     def _merge(self, x):
         B, h, L, dk = x.shape
         return x.transpose(1, 2).contiguous().view(B, L, h * dk)
+    
     def forward(self, x, mask=None):
-        q = self._split(self.q(x)); k = self._split(self.k(x)); v = self._split(self.v(x))
+        q = self._split(self.q(x))
+        k = self._split(self.k(x))
+        v = self._split(self.v(x))
         y, _ = scaled_dot_attn(q, k, v, mask=mask, dropout=self.drop)
         return self.o(self._merge(y))
 
@@ -238,14 +193,16 @@ class PositionwiseFFN(nn.Module):
         self.w1 = nn.Linear(d_model, d_ff)
         self.w2 = nn.Linear(d_ff, d_model)
         self.drop = nn.Dropout(dropout)
-    def forward(self, x): return self.w2(self.drop(F.gelu(self.w1(x))))
+    def forward(self, x): 
+        return self.w2(self.drop(F.gelu(self.w1(x))))
 
 class DecoderBlock(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, dropout=0.1):
         super().__init__()
         self.self_attn = MultiHeadedAttention(n_heads, d_model, dropout)
         self.ffn = PositionwiseFFN(d_model, d_ff, dropout)
-        self.n1 = LayerNorm(d_model); self.n2 = LayerNorm(d_model)
+        self.n1 = nn.LayerNorm(d_model, eps=1e-5)
+        self.n2 = nn.LayerNorm(d_model, eps=1e-5)
         self.drop = nn.Dropout(dropout)
     def forward(self, x, attn_mask):
         x = x + self.drop(self.self_attn(self.n1(x), mask=attn_mask))
@@ -259,24 +216,28 @@ class DecoderOnlyTransformer(nn.Module):
         self.tok = Embeddings(d_model, vocab_size, padding_idx=pad_id)
         self.pos = PositionalEncoding(d_model, dropout, max_len)
         self.layers = nn.ModuleList([DecoderBlock(d_model, n_heads, d_ff, dropout) for _ in range(n_layers)])
-        self.norm = LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model, eps=1e-5)
         self.lm = nn.Linear(d_model, vocab_size, bias=False)
+
     def causal_mask(self, L, device):
-        return torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1).unsqueeze(0).unsqueeze(0)
+        return torch.triu(torch.ones(L, L, dtype=torch.bool, device=device), diagonal=1).unsqueeze(0).unsqueeze(0) #[1, 1, L, L]
+    
     def pad_mask(self, x):
         if self.pad_id is None: return None
-        return (x == self.pad_id).unsqueeze(1).unsqueeze(2)
+        return (x == self.pad_id).unsqueeze(1).unsqueeze(2) # [B, L] -> [B, 1, 1, L]
+    
     def forward(self, x):
         L = x.size(1)
         h = self.pos(self.tok(x))
-        c = self.causal_mask(L, x.device)
-        p = self.pad_mask(x)
-        m = c if p is None else (c | p)
-        for blk in self.layers: h = blk(h, m)
+        c = self.causal_mask(L, x.device) #causal block
+        p = self.pad_mask(x) #pad block
+        m = c if p is None else (c | p) #final mask
+        for blk in self.layers: 
+            h = blk(h, m)
         h = self.norm(h)
         return torch.log_softmax(self.lm(h), dim=-1)
 
-# -------------------- Trening/Ewaluacja --------------------
+
 def train_epoch(model, loader, opt, pad_id, amp_dtype=AMP_DTYPE, accum_steps=1, update_every=20):
     model.train()
     total_loss, total_tok = 0.0, 0
@@ -326,12 +287,10 @@ def eval_ppl(model, loader, pad_id):
         total_tok  += y.numel() if pad_id is None else (y != pad_id).sum().item()
     return math.exp(total_loss / max(1, total_tok))
 
-# -------------------- Main --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
-    ap.add_argument("--output_dir", default="out")
-    ap.add_argument("--hf_tokenizer_id", default=None)  # np. speakleash/Bielik-7B-v0.1
+    ap.add_argument("--output_dir", default="out") 
     ap.add_argument("--vocab_size", type=int, default=50000)
 
     ap.add_argument("--seq_len", type=int, default=256)
@@ -366,15 +325,8 @@ def main():
 
     tokenizer, pad_id, bos_id, eos_id = load_tokenizer(args)
 
-    # --- po load_tokenizer(args)
-    if hasattr(tokenizer, "get_vocab"):             # HF tokenizers
-        vocab_size = len(tokenizer.get_vocab())
-    elif hasattr(tokenizer, "get_vocab_size"):      # tokenizers.Tokenizer
-        vocab_size = int(tokenizer.get_vocab_size())
-    else:                                           # fallback
-        vocab_size = int(getattr(tokenizer, "vocab_size"))
-    
-    # dopilnuj, że indeksy specjalnych tokenów mieszczą się w Embeddingach
+    vocab_size = tokenizer.vocab_size
+
     vocab_size = max(
         vocab_size,
         (pad_id or -1) + 1,
@@ -382,40 +334,22 @@ def main():
         (eos_id or -1) + 1,
     )
 
-    if not args.gen:
-        out_tok = Path(args.output_dir)
-        if not (out_tok / "tokenizer_hf").exists() and not (out_tok / "tokenizer.json").exists():
-            try:
-                # HuggingFace fast tokenizer
-                (out_tok / "tokenizer_hf").mkdir(parents=True, exist_ok=True)
-                tokenizer.save_pretrained(str(out_tok / "tokenizer_hf"))
-            except Exception:
-                # tokenizers.Tokenizer (fallback)
-                (out_tok / "tokenizer.json").write_text(tokenizer.to_str(), encoding="utf-8")
 
-    
-    # gdzie zapisać / skąd wczytać konfigurację modelu
     cfg_path = Path(args.output_dir) / "model_config.json"
     
     if args.gen:
-        # --- GENERACJA: wczytaj konfigurację, żeby zbudować model 1:1 jak w treningu
         assert cfg_path.exists(), f"Brak {cfg_path}. Najpierw odpal trening, żeby zapisać konfigurację."
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        # nadpisz parametry architektury z pliku
         args.d_model  = cfg.get("d_model",  args.d_model)
         args.n_layers = cfg.get("n_layers", args.n_layers)
         args.n_heads  = cfg.get("n_heads",  args.n_heads)
         args.d_ff     = cfg.get("d_ff",     args.d_ff)
         args.dropout  = cfg.get("dropout",  args.dropout)
-        # jeśli w pliku był pad_id – możesz go też wziąć
         if "pad_id" in cfg:
                 pad_id = cfg["pad_id"]
     else:
-        # --- TRENING: po zbudowaniu modelu zapisz jego konfigurację do pliku
-        pass  # (faktyczny zapis zrobimy *po* utworzeniu modelu, patrz blok 2 poniżej)
-    # Zapisz tokenizer (raz) – ale nie jest to wymagane, gdy już zapisany
+        pass 
     
-    # >>> TU ZAWSZE budujemy model (poza try/except)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DecoderOnlyTransformer(
         vocab_size=vocab_size,
@@ -442,7 +376,6 @@ def main():
         cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
     
-    # --- GENERACJA ---
     if args.gen:
         assert args.ckpt is not None, "Podaj --ckpt ze ścieżką do wag (np. out_x/last.pt)"
         state = torch.load(args.ckpt, map_location=device)
@@ -460,12 +393,11 @@ def main():
             print("OUTPUT:", out)
         return
 
-    # >>> ZAMIANA: dzielimy tokenowo zamiast po plikach
     all_files = sorted(Path(args.data_dir).glob("*.txt")) + sorted(Path(args.data_dir).glob("*.txt.gz"))
     assert all_files, "Brak plików .txt/.txt.gz w data_dir"
     
-    all_ids = encode_corpus(tokenizer, all_files, bos_id, eos_id)   # wszystko w jeden strumień
-    val_ratio = getattr(args, "val_ratio", 0.02)                    # 2% na walidację domyślnie
+    all_ids = encode_corpus(tokenizer, all_files, bos_id, eos_id)  
+    val_ratio = getattr(args, "val_ratio", 0.02)              
     cut = int((1.0 - val_ratio) * len(all_ids))
     
     train_ids = all_ids[:cut]
@@ -494,21 +426,18 @@ def main():
         tr_ppl = train_epoch(model, dl_train, opt, pad_id, accum_steps=args.accum_steps)
         va_ppl = eval_ppl(model, dl_valid, pad_id) if len(valid_ds) > 0 else float("nan")
     
-        # --- NEW: czasy + throughput ---
         epoch_sec   = time.time() - epoch_start
         elapsed_sec = time.time() - run_start
         steps = len(dl_train)
         tokens_epoch_est = steps * args.batch_size * args.seq_len
         tps = tokens_epoch_est / max(1e-9, epoch_sec)
     
-        # „loss” = ln(PPL) – czysto informacyjnie
         tr_loss = math.log(tr_ppl) if tr_ppl > 0 else float("nan")
         va_loss = math.log(va_ppl) if (va_ppl > 0 and not math.isnan(va_ppl)) else float("nan")
     
         print(f"[epoch {e}] train PPL={tr_ppl:.2f} | valid PPL={va_ppl:.2f} | "
               f"epoch={epoch_sec:6.1f}s | elapsed={elapsed_sec:7.1f}s | tok/s~{tps:,.0f}")
     
-        # --- NEW: zapis do CSV ---
         log_metrics_csv(log_path, {
             "epoch": e,
             "split": "train",
@@ -530,7 +459,6 @@ def main():
                 "tokens_per_s": round(tps, 1),
             }, field_order=log_fields)
     
-        # checkpointy
         torch.save(model.state_dict(), Path(args.output_dir) / "last.pt")
         if va_ppl < best:
             best = va_ppl
