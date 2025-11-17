@@ -2,6 +2,7 @@ import os, math, gzip, argparse, random
 from pathlib import Path
 from typing import List, Optional
 import json
+import csv, time
 
 import torch
 import torch.nn as nn
@@ -40,15 +41,17 @@ def _sample_next(logits, temperature=0.9, top_p=0.9):
 @torch.no_grad()
 def generate_text(model, tokenizer, prompt, max_new_tokens=150, temperature=0.9, top_p=0.9):
     model.eval()
-    ids = tok_encode(tokenizer, prompt)                        
+    ids = tok_encode(tokenizer, prompt)                         # <- wrapper
     x = torch.tensor([ids], device=next(model.parameters()).device)
     for _ in range(max_new_tokens):
         inp = x[:, -model.pos.pe.size(0):]
-        logp = model(inp)                                 
+        logp = model(inp)                                       # [B, L, V] (log-softmax)
         next_id = _sample_next(logp[:, -1, :].float(), temperature, top_p)
         x = torch.cat([x, next_id], dim=1)
     return tok_decode(tokenizer, x[0].tolist())
 
+
+# -------------------- Tokenizer --------------------
 def train_bpe_tokenizer(files: List[Path], vocab_size=50000) -> Tokenizer:
     tok = Tokenizer(models.BPE(unk_token="[UNK]"))
     tok.pre_tokenizer = pre_tokenizers.ByteLevel()
@@ -58,33 +61,37 @@ def train_bpe_tokenizer(files: List[Path], vocab_size=50000) -> Tokenizer:
 
 def tok_encode(tokenizer, text: str):
     try:
-        out = tokenizer.encode(text, add_special_tokens=False)  
+        out = tokenizer.encode(text, add_special_tokens=False)  # HF fast -> list[int]
     except TypeError:
-        out = tokenizer.encode(text)                           
-    return out.ids if hasattr(out, "ids") else out            
+        out = tokenizer.encode(text)                            # tokenizers.Tokenizer -> Encoding
+    return out.ids if hasattr(out, "ids") else out              # zawsze list[int]
 
 def tok_decode(tokenizer, ids):
     try:
         return tokenizer.decode(ids, skip_special_tokens=True)
     except TypeError:
+        # ścieżka dla tokenizers.Tokenizer
         return tokenizer.decode(ids)
 
 
 def load_tokenizer(args):
     tok_dir = Path(args.output_dir)
 
+    # 0) Jeśli podano HF – bierz HF *zawsze*.
     if args.hf_tokenizer_id:
         tok = AutoTokenizer.from_pretrained(args.hf_tokenizer_id, use_fast=True)
         if tok.pad_token is None:
             tok.add_special_tokens({"pad_token": "[PAD]"})
         return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
 
+    # 1) Lokalny zapisany (HF)
     if (tok_dir / "tokenizer_hf").exists():
         tok = AutoTokenizer.from_pretrained(tok_dir / "tokenizer_hf", use_fast=True)
         if tok.pad_token is None:
             tok.add_special_tokens({"pad_token": "[PAD]"})
         return tok, tok.pad_token_id, tok.bos_token_id, tok.eos_token_id
 
+    # 2) Lokalny tokenizers.Tokenizer
     if (tok_dir / "tokenizer.json").exists():
         tok = Tokenizer.from_file(str(tok_dir / "tokenizer.json"))
         pad_id = tok.token_to_id("[PAD]")
@@ -93,7 +100,7 @@ def load_tokenizer(args):
         return tok, pad_id, bos_id, eos_id
 
 
-
+    # 3) Brak – trenuj własny
     files = sorted(Path(args.data_dir).glob("*.txt")) + sorted(Path(args.data_dir).glob("*.txt.gz"))
     assert files, "Brak plików .txt/.txt.gz w data_dir"
     tok = train_bpe_tokenizer(files, args.vocab_size)
@@ -103,6 +110,8 @@ def load_tokenizer(args):
     return tok, pad_id, bos_id, eos_id
 
 
+
+# -------------------- Dane --------------------
 def _read_text(fp: Path) -> str:
     if str(fp).endswith(".gz"):
         with gzip.open(fp, "rt", encoding="utf-8", errors="ignore") as f:
@@ -125,7 +134,7 @@ class CLMDataset(Dataset):
     def __init__(self, token_ids: List[int], seq_len=128, stride: Optional[int] = None):
         self.ids = token_ids
         self.seq_len = seq_len
-        self.stride = stride or seq_len 
+        self.stride = stride or seq_len  # domyślnie brak nakładania
 
         if len(self.ids) < (self.seq_len + 1):
             self.n = 0
@@ -151,6 +160,16 @@ def collate(batch):
     y = torch.stack([b["labels"]    for b in batch])
     return {"input_ids": x, "labels": y}
 
+def log_metrics_csv(path: Path, row: dict, field_order):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with path.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=field_order)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+# -------------------- Model (decoder-only, mały) --------------------
 class LayerNorm(nn.Module):
     def __init__(self, d_model, eps=1e-5):
         super().__init__()
@@ -257,6 +276,7 @@ class DecoderOnlyTransformer(nn.Module):
         h = self.norm(h)
         return torch.log_softmax(self.lm(h), dim=-1)
 
+# -------------------- Trening/Ewaluacja --------------------
 def train_epoch(model, loader, opt, pad_id, amp_dtype=AMP_DTYPE, accum_steps=1, update_every=20):
     model.train()
     total_loss, total_tok = 0.0, 0
@@ -306,11 +326,12 @@ def eval_ppl(model, loader, pad_id):
         total_tok  += y.numel() if pad_id is None else (y != pad_id).sum().item()
     return math.exp(total_loss / max(1, total_tok))
 
+# -------------------- Main --------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_dir", required=True)
     ap.add_argument("--output_dir", default="out")
-    ap.add_argument("--hf_tokenizer_id", default=None)  
+    ap.add_argument("--hf_tokenizer_id", default=None)  # np. speakleash/Bielik-7B-v0.1
     ap.add_argument("--vocab_size", type=int, default=50000)
 
     ap.add_argument("--seq_len", type=int, default=256)
@@ -345,13 +366,15 @@ def main():
 
     tokenizer, pad_id, bos_id, eos_id = load_tokenizer(args)
 
-    if hasattr(tokenizer, "get_vocab"):             
+    # --- po load_tokenizer(args)
+    if hasattr(tokenizer, "get_vocab"):             # HF tokenizers
         vocab_size = len(tokenizer.get_vocab())
-    elif hasattr(tokenizer, "get_vocab_size"):     
+    elif hasattr(tokenizer, "get_vocab_size"):      # tokenizers.Tokenizer
         vocab_size = int(tokenizer.get_vocab_size())
-    else:                                       
+    else:                                           # fallback
         vocab_size = int(getattr(tokenizer, "vocab_size"))
     
+    # dopilnuj, że indeksy specjalnych tokenów mieszczą się w Embeddingach
     vocab_size = max(
         vocab_size,
         (pad_id or -1) + 1,
@@ -363,26 +386,36 @@ def main():
         out_tok = Path(args.output_dir)
         if not (out_tok / "tokenizer_hf").exists() and not (out_tok / "tokenizer.json").exists():
             try:
+                # HuggingFace fast tokenizer
                 (out_tok / "tokenizer_hf").mkdir(parents=True, exist_ok=True)
                 tokenizer.save_pretrained(str(out_tok / "tokenizer_hf"))
             except Exception:
+                # tokenizers.Tokenizer (fallback)
                 (out_tok / "tokenizer.json").write_text(tokenizer.to_str(), encoding="utf-8")
 
+    
+    # gdzie zapisać / skąd wczytać konfigurację modelu
     cfg_path = Path(args.output_dir) / "model_config.json"
     
     if args.gen:
+        # --- GENERACJA: wczytaj konfigurację, żeby zbudować model 1:1 jak w treningu
         assert cfg_path.exists(), f"Brak {cfg_path}. Najpierw odpal trening, żeby zapisać konfigurację."
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        # nadpisz parametry architektury z pliku
         args.d_model  = cfg.get("d_model",  args.d_model)
         args.n_layers = cfg.get("n_layers", args.n_layers)
         args.n_heads  = cfg.get("n_heads",  args.n_heads)
         args.d_ff     = cfg.get("d_ff",     args.d_ff)
         args.dropout  = cfg.get("dropout",  args.dropout)
+        # jeśli w pliku był pad_id – możesz go też wziąć
         if "pad_id" in cfg:
                 pad_id = cfg["pad_id"]
     else:
-        pass 
+        # --- TRENING: po zbudowaniu modelu zapisz jego konfigurację do pliku
+        pass  # (faktyczny zapis zrobimy *po* utworzeniu modelu, patrz blok 2 poniżej)
+    # Zapisz tokenizer (raz) – ale nie jest to wymagane, gdy już zapisany
     
+    # >>> TU ZAWSZE budujemy model (poza try/except)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DecoderOnlyTransformer(
         vocab_size=vocab_size,
@@ -409,6 +442,7 @@ def main():
         cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
     
+    # --- GENERACJA ---
     if args.gen:
         assert args.ckpt is not None, "Podaj --ckpt ze ścieżką do wag (np. out_x/last.pt)"
         state = torch.load(args.ckpt, map_location=device)
@@ -426,11 +460,12 @@ def main():
             print("OUTPUT:", out)
         return
 
+    # >>> ZAMIANA: dzielimy tokenowo zamiast po plikach
     all_files = sorted(Path(args.data_dir).glob("*.txt")) + sorted(Path(args.data_dir).glob("*.txt.gz"))
     assert all_files, "Brak plików .txt/.txt.gz w data_dir"
     
-    all_ids = encode_corpus(tokenizer, all_files, bos_id, eos_id) 
-    val_ratio = getattr(args, "val_ratio", 0.02)                
+    all_ids = encode_corpus(tokenizer, all_files, bos_id, eos_id)   # wszystko w jeden strumień
+    val_ratio = getattr(args, "val_ratio", 0.02)                    # 2% na walidację domyślnie
     cut = int((1.0 - val_ratio) * len(all_ids))
     
     train_ids = all_ids[:cut]
@@ -448,17 +483,59 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
 
+    log_path   = Path(args.output_dir) / "train_log.csv"
+    log_fields = ["epoch", "split", "loss", "ppl", "epoch_time_s", "elapsed_s", "tokens_per_s"]
+    run_start  = time.time()
+
     best = float("inf")
     for e in range(1, args.epochs + 1):
+        epoch_start = time.time()
+    
         tr_ppl = train_epoch(model, dl_train, opt, pad_id, accum_steps=args.accum_steps)
         va_ppl = eval_ppl(model, dl_valid, pad_id) if len(valid_ds) > 0 else float("nan")
-        print(f"[epoch {e}] train PPL={tr_ppl:.2f} | valid PPL={va_ppl:.2f}")
+    
+        # --- NEW: czasy + throughput ---
+        epoch_sec   = time.time() - epoch_start
+        elapsed_sec = time.time() - run_start
+        steps = len(dl_train)
+        tokens_epoch_est = steps * args.batch_size * args.seq_len
+        tps = tokens_epoch_est / max(1e-9, epoch_sec)
+    
+        # „loss” = ln(PPL) – czysto informacyjnie
+        tr_loss = math.log(tr_ppl) if tr_ppl > 0 else float("nan")
+        va_loss = math.log(va_ppl) if (va_ppl > 0 and not math.isnan(va_ppl)) else float("nan")
+    
+        print(f"[epoch {e}] train PPL={tr_ppl:.2f} | valid PPL={va_ppl:.2f} | "
+              f"epoch={epoch_sec:6.1f}s | elapsed={elapsed_sec:7.1f}s | tok/s~{tps:,.0f}")
+    
+        # --- NEW: zapis do CSV ---
+        log_metrics_csv(log_path, {
+            "epoch": e,
+            "split": "train",
+            "loss": tr_loss,
+            "ppl": tr_ppl,
+            "epoch_time_s": round(epoch_sec, 3),
+            "elapsed_s": round(elapsed_sec, 3),
+            "tokens_per_s": round(tps, 1),
+        }, field_order=log_fields)
+    
+        if not math.isnan(va_ppl):
+            log_metrics_csv(log_path, {
+                "epoch": e,
+                "split": "valid",
+                "loss": va_loss,
+                "ppl": va_ppl,
+                "epoch_time_s": round(epoch_sec, 3),
+                "elapsed_s": round(elapsed_sec, 3),
+                "tokens_per_s": round(tps, 1),
+            }, field_order=log_fields)
+    
+        # checkpointy
         torch.save(model.state_dict(), Path(args.output_dir) / "last.pt")
         if va_ppl < best:
             best = va_ppl
             torch.save(model.state_dict(), Path(args.output_dir) / "best.pt")
-
-    print("Done.")
+    
 
 if __name__ == "__main__":
     main()
